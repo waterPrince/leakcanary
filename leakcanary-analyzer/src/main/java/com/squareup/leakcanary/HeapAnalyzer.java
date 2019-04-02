@@ -43,14 +43,17 @@ import static com.squareup.leakcanary.AnalyzerProgressListener.Step.BUILDING_LEA
 import static com.squareup.leakcanary.AnalyzerProgressListener.Step.COMPUTING_DOMINATORS;
 import static com.squareup.leakcanary.AnalyzerProgressListener.Step.DEDUPLICATING_GC_ROOTS;
 import static com.squareup.leakcanary.AnalyzerProgressListener.Step.FINDING_LEAKING_REF;
+import static com.squareup.leakcanary.AnalyzerProgressListener.Step.FINDING_LEAKING_REFS;
 import static com.squareup.leakcanary.AnalyzerProgressListener.Step.FINDING_SHORTEST_PATH;
 import static com.squareup.leakcanary.AnalyzerProgressListener.Step.PARSING_HEAP_DUMP;
 import static com.squareup.leakcanary.AnalyzerProgressListener.Step.READING_HEAP_DUMP_FILE;
 import static com.squareup.leakcanary.HahaHelper.asString;
+import static com.squareup.leakcanary.HahaHelper.asStringArray;
 import static com.squareup.leakcanary.HahaHelper.classInstanceValues;
 import static com.squareup.leakcanary.HahaHelper.extendsThread;
 import static com.squareup.leakcanary.HahaHelper.fieldValue;
 import static com.squareup.leakcanary.HahaHelper.hasField;
+import static com.squareup.leakcanary.HahaHelper.staticFieldValue;
 import static com.squareup.leakcanary.HahaHelper.threadName;
 import static com.squareup.leakcanary.HahaHelper.valueAsString;
 import static com.squareup.leakcanary.LeakTraceElement.Holder.ARRAY;
@@ -62,6 +65,7 @@ import static com.squareup.leakcanary.LeakTraceElement.Type.INSTANCE_FIELD;
 import static com.squareup.leakcanary.LeakTraceElement.Type.STATIC_FIELD;
 import static com.squareup.leakcanary.Reachability.Status.REACHABLE;
 import static com.squareup.leakcanary.Reachability.Status.UNREACHABLE;
+import static java.util.Collections.singletonList;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 /**
@@ -136,7 +140,7 @@ public final class HeapAnalyzer {
   /**
    * Calls {@link #checkForLeak(File, String, boolean)} with computeRetainedSize set to true.
    *
-   * @deprecated Use {@link #checkForLeak(File, String, boolean)} instead.
+   * @deprecated Use {@link #checkForLeaks(File, boolean)} instead.
    */
   @Deprecated
   public @NonNull AnalysisResult checkForLeak(@NonNull File heapDumpFile,
@@ -147,7 +151,10 @@ public final class HeapAnalyzer {
   /**
    * Searches the heap dump for a {@link KeyedWeakReference} instance with the corresponding key,
    * and then computes the shortest strong reference path from that instance to the GC roots.
+   *
+   * @deprecated Use {@link #checkForLeaks(File, boolean)} instead.
    */
+  @Deprecated
   public @NonNull AnalysisResult checkForLeak(@NonNull File heapDumpFile,
       @NonNull String referenceKey,
       boolean computeRetainedSize) {
@@ -175,6 +182,80 @@ public final class HeapAnalyzer {
       return findLeakTrace(analysisStartNanoTime, snapshot, leakingRef, computeRetainedSize);
     } catch (Throwable e) {
       return failure(e, since(analysisStartNanoTime));
+    }
+  }
+
+  /**
+   * Searches the heap dump for a {@link KeyedWeakReference} instance with the corresponding key,
+   * and then computes the shortest strong reference path from that instance to the GC roots.
+   */
+  public @NonNull List<AnalysisResult> checkForLeaks(@NonNull File heapDumpFile,
+      boolean computeRetainedSize) {
+    long analysisStartNanoTime = System.nanoTime();
+
+    if (!heapDumpFile.exists()) {
+      Exception exception = new IllegalArgumentException("File does not exist: " + heapDumpFile);
+      return singletonList(failure(exception, since(analysisStartNanoTime)));
+    }
+
+    try {
+      listener.onProgressUpdate(READING_HEAP_DUMP_FILE);
+      DataBuffer buffer = new MemoryMappedFileBuffer(heapDumpFile);
+      listener.onProgressUpdate(PARSING_HEAP_DUMP);
+      Snapshot snapshot = Snapshot.createSnapshot(buffer);
+      listener.onProgressUpdate(DEDUPLICATING_GC_ROOTS);
+      deduplicateGcRoots(snapshot);
+      listener.onProgressUpdate(FINDING_LEAKING_REFS);
+
+      ClassObj refWatcherClass = snapshot.findClass(RefWatcher.class.getName());
+      ArrayInstance retainedKeysArray =
+          staticFieldValue(refWatcherClass, "retainedKeysForHeapDump");
+      List<String> retainedKeys = asStringArray(retainedKeysArray);
+
+      // False alarm, weak reference was cleared in between key check and heap dump.
+      if (retainedKeys.size() == 0) {
+        IllegalStateException exception =
+            new IllegalStateException("No retained keys found in heap dump");
+        return singletonList(failure(exception, since(analysisStartNanoTime)));
+      }
+
+      ClassObj refClass = snapshot.findClass(KeyedWeakReference.class.getName());
+      if (refClass == null) {
+        throw new IllegalStateException(
+            "Could not find the "
+                + KeyedWeakReference.class.getName()
+                + " class in the heap dump.");
+      }
+      List<Instance> leakingRefs = new ArrayList<>();
+      List<String> keysFound = new ArrayList<>();
+      for (Instance instance : refClass.getInstancesList()) {
+        List<ClassInstance.FieldValue> values = classInstanceValues(instance);
+        Object keyFieldValue = fieldValue(values, "key");
+        if (keyFieldValue == null) {
+          keysFound.add(null);
+          continue;
+        }
+        String keyCandidate = asString(keyFieldValue);
+        boolean wasRetained = retainedKeys.remove(keyCandidate);
+        if (wasRetained) {
+          Instance referent = fieldValue(values, "referent");
+          leakingRefs.add(referent);
+        }
+        keysFound.add(keyCandidate);
+      }
+      if (retainedKeys.size() > 0) {
+        throw new IllegalStateException(
+            "Could not find weak references with keys " + retainedKeys + " in " + keysFound);
+      }
+
+      List<AnalysisResult> analysisResults = new ArrayList<>();
+      for (Instance leakingRef : leakingRefs) {
+        analysisResults.add(
+            findLeakTrace(analysisStartNanoTime, snapshot, leakingRef, computeRetainedSize));
+      }
+      return analysisResults;
+    } catch (Throwable e) {
+      return singletonList(failure(e, since(analysisStartNanoTime)));
     }
   }
 
@@ -319,7 +400,8 @@ public final class HeapAnalyzer {
       if (reachability.status == Reachability.Status.UNKNOWN) {
         if (i <= lastReachableElementIndex) {
           String lastReachableName = elements.get(lastReachableElementIndex).getSimpleClassName();
-          expectedReachability.set(i, Reachability.reachable(lastReachableName + " is not leaking"));
+          expectedReachability.set(i,
+              Reachability.reachable(lastReachableName + " is not leaking"));
         } else if (i >= firstUnreachableElementIndex) {
           String firstUnreachableName =
               elements.get(firstUnreachableElementIndex).getSimpleClassName();
@@ -340,7 +422,6 @@ public final class HeapAnalyzer {
     }
     return Reachability.unknown();
   }
-
 
   private LeakTraceElement buildLeakElement(LeakNode node) {
     if (node.parent == null) {

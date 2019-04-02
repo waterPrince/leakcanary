@@ -15,46 +15,62 @@
  */
 package com.squareup.leakcanary;
 
+import java.io.IOException;
 import java.lang.ref.ReferenceQueue;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CopyOnWriteArraySet;
 
+/**
+ * Thread safe by locking on all methods, which should be reasonably efficient given how often
+ * these methods are accessed.
+ */
 public final class RefWatcher {
 
   // TODO Remove this, there should be a different API for overall on / off.
-  public static final RefWatcher DISABLED = new RefWatcher();
+  public static final RefWatcher DISABLED = new RefWatcher(new Clock() {
+    @Override public long uptimeMillis() {
+      return 0;
+    }
+  });
 
   public interface NewRefListener {
     void onNewKeyedWeakReference(KeyedWeakReference reference);
   }
 
-  private final Set<String> retainedKeys;
+  private final Clock clock;
+  private final Map<String, Long> retainedKeysWithUptimeMillis;
   private final ReferenceQueue<Object> queue;
-  // TODO What makes sense for thread safety here?
   private final List<NewRefListener> newRefListeners;
 
-  RefWatcher() {
-    retainedKeys = new CopyOnWriteArraySet<>();
+  // TODO These things could probably move out of here.
+  private static String[] retainedKeysForHeapDump;
+  private static long heapDumpUptimeMillis;
+
+  RefWatcher(Clock clock) {
+    this.clock = clock;
+    retainedKeysWithUptimeMillis = new LinkedHashMap<>();
     queue = new ReferenceQueue<>();
     newRefListeners = new ArrayList<>();
   }
 
-  public void addNewRefListener(NewRefListener listener) {
+  public synchronized void addNewRefListener(NewRefListener listener) {
     newRefListeners.add(listener);
   }
 
-  public void removeNewRefListener(NewRefListener listener) {
+  public synchronized void removeNewRefListener(NewRefListener listener) {
     newRefListeners.remove(listener);
   }
 
   /**
    * Identical to {@link #watch(Object, String)} with an empty string reference name.
    */
-  public void watch(Object watchedReference) {
+  public synchronized void watch(Object watchedReference) {
     watch(watchedReference, "");
   }
 
@@ -65,48 +81,79 @@ public final class RefWatcher {
    *
    * @param referenceName An logical identifier for the watched object.
    */
-  public void watch(Object watchedReference, String referenceName) {
+  public synchronized void watch(Object watchedReference, String referenceName) {
     String key = UUID.randomUUID().toString();
-    retainedKeys.add(key);
+    long watchUptimeMillis = clock.uptimeMillis();
+    System.out.println("Watching key "+key+ " "+referenceName);
+    retainedKeysWithUptimeMillis.put(key, watchUptimeMillis);
     KeyedWeakReference reference =
-        new KeyedWeakReference(watchedReference, key, referenceName, queue);
+        new KeyedWeakReference(watchedReference, key, referenceName, watchUptimeMillis, queue);
 
     for (NewRefListener listener : newRefListeners) {
       listener.onNewKeyedWeakReference(reference);
     }
   }
 
+  public interface HeapSaver {
+    void saveHeap() throws IOException;
+  }
+
+  public synchronized void saveRetainedKeysWithHeapDump(HeapSaver heapSaver) throws IOException {
+    System.out.println("saveRetainedKeysWithHeapDump");
+    removeWeaklyReachableReferences();
+    // TODO Bake this in the API
+    if (retainedKeysWithUptimeMillis.isEmpty()) {
+      throw new IOException("Nothing leaking to look for");
+    }
+    retainedKeysForHeapDump = retainedKeysWithUptimeMillis.keySet().toArray(new String[0]);
+    heapDumpUptimeMillis = clock.uptimeMillis();
+    try {
+      heapSaver.saveHeap();
+    } finally {
+      retainedKeysForHeapDump = null;
+    }
+    // The retained keys are all in the heap dump now, the next heap dump analysis should not look
+    // for these. We only clear if the heap dumping did not throw.
+    retainedKeysWithUptimeMillis.clear();
+  }
+
   /**
    * LeakCanary will stop watching any references that were passed to {@link #watch(Object, String)}
    * so far.
    */
-  public void clearWatchedReferences() {
-    // TODO The heap dumper should be able to get the set of watched refs and then tell ref watcher
-    // to remove all of those (and mark them as such in a KeyedWeakRef field).
-    // That way they're clearly identifiable prior as well as after.
-    retainedKeys.clear();
+  public synchronized void clearWatchedReferences() {
+    System.out.println("clearWatchedReferences");
+    retainedKeysWithUptimeMillis.clear();
   }
 
-  boolean isEmpty() {
+  public synchronized boolean hasReferencesOlderThan(int durationMillis) {
     removeWeaklyReachableReferences();
-    return retainedKeys.isEmpty();
+    long now = clock.uptimeMillis();
+    int count = 0;
+    for (Long retainedKeyUptimeMillis : retainedKeysWithUptimeMillis.values()) {
+      if (now - retainedKeyUptimeMillis >= durationMillis) {
+        count++;
+      }
+    }
+    return count > 0;
   }
 
-  Set<String> getRetainedKeys() {
-    return new HashSet<>(retainedKeys);
-  }
-
-  public boolean gone(KeyedWeakReference reference) {
+  synchronized boolean isEmpty() {
     removeWeaklyReachableReferences();
-    return !retainedKeys.contains(reference.key);
+    return retainedKeysWithUptimeMillis.isEmpty();
   }
 
-  private void removeWeaklyReachableReferences() {
+  synchronized Set<String> getRetainedKeys() {
+    return new HashSet<>(retainedKeysWithUptimeMillis.keySet());
+  }
+
+  private synchronized void removeWeaklyReachableReferences() {
     // WeakReferences are enqueued as soon as the object to which they point to becomes weakly
     // reachable. This is before finalization or garbage collection has actually happened.
     KeyedWeakReference ref;
     while ((ref = (KeyedWeakReference) queue.poll()) != null) {
-      retainedKeys.remove(ref.key);
+      System.out.println("removed "+ref.key);
+      retainedKeysWithUptimeMillis.remove(ref.key);
     }
   }
 }

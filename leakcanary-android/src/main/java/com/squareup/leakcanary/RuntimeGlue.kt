@@ -45,16 +45,27 @@ class RuntimeGlue constructor(
     val gcStartNanoTime = System.nanoTime()
     val watchDurationMs = NANOSECONDS.toMillis(gcStartNanoTime - watchStartNanoTime)
 
+    CanaryLog.d("ensure gone for "+reference.key+ " "+reference.name)
     if (debuggerControl.isDebuggerAttached) {
       // The debugger can create false leaks.
+      CanaryLog.d("debugger attached")
       return RETRY
     }
 
-    if (refWatcher.gone(reference)) {
+    if (refWatcher.isEmpty) {
+      CanaryLog.d("refWatcher empty")
       return DONE
     }
+
+    // TODO Configure. Instead of one runnable per weak ref, it shoud be just the one,
+    // scheduled for when the earliest ref was posted.
+    if (!refWatcher.hasReferencesOlderThan(5000)) {
+      CanaryLog.d("no old ref")
+      return RETRY
+    }
     gcTrigger.runGc()
-    if (!refWatcher.gone(reference)) {
+    if (refWatcher.hasReferencesOlderThan(5000)) {
+      CanaryLog.d("found refs")
       val startDumpHeap = System.nanoTime()
       val gcDurationMs = NANOSECONDS.toMillis(startDumpHeap - gcStartNanoTime)
 

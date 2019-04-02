@@ -26,6 +26,7 @@ import com.squareup.leakcanary.CanaryLog;
 import com.squareup.leakcanary.HeapAnalyzer;
 import com.squareup.leakcanary.HeapDump;
 import com.squareup.leakcanary.R;
+import java.util.List;
 
 import static com.squareup.leakcanary.internal.LeakCanaryInternals.setEnabledBlocking;
 
@@ -64,9 +65,11 @@ public final class HeapAnalyzerService extends ForegroundService
     HeapAnalyzer heapAnalyzer =
         new HeapAnalyzer(heapDump.excludedRefs, this, heapDump.reachabilityInspectorClasses);
 
-    AnalysisResult result = heapAnalyzer.checkForLeak(heapDump.heapDumpFile, heapDump.referenceKey,
-        heapDump.computeRetainedHeapSize);
-    AbstractAnalysisResultService.sendResultToListener(this, listenerClassName, heapDump, result);
+    List<AnalysisResult> analysisResults =
+        heapAnalyzer.checkForLeaks(heapDump.heapDumpFile, heapDump.computeRetainedHeapSize);
+    for (AnalysisResult result : analysisResults) {
+      AbstractAnalysisResultService.sendResultToListener(this, listenerClassName, heapDump, result);
+    }
   }
 
   @Override public void onProgressUpdate(Step step) {

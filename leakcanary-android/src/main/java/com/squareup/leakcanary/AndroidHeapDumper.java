@@ -34,21 +34,25 @@ import com.squareup.leakcanary.internal.ActivityLifecycleCallbacksAdapter;
 import com.squareup.leakcanary.internal.FutureResult;
 import com.squareup.leakcanary.internal.LeakCanaryInternals;
 import java.io.File;
+import java.io.IOException;
+import java.util.concurrent.Callable;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 public final class AndroidHeapDumper implements HeapDumper {
 
   private final Context context;
+  private final RefWatcher refWatcher;
   private final LeakDirectoryProvider leakDirectoryProvider;
   private final Handler mainHandler;
 
   private Activity resumedActivity;
 
   public AndroidHeapDumper(@NonNull Context context,
-      @NonNull LeakDirectoryProvider leakDirectoryProvider) {
+      @NonNull LeakDirectoryProvider leakDirectoryProvider, RefWatcher refWatcher) {
     this.leakDirectoryProvider = leakDirectoryProvider;
     this.context = context.getApplicationContext();
+    this.refWatcher = refWatcher;
     mainHandler = new Handler(Looper.getMainLooper());
 
     Application application = (Application) context.getApplicationContext();
@@ -68,7 +72,7 @@ public final class AndroidHeapDumper implements HeapDumper {
   @SuppressWarnings("ReferenceEquality") // Explicitly checking for named null.
   @Override @Nullable
   public File dumpHeap() {
-    File heapDumpFile = leakDirectoryProvider.newHeapDumpFile();
+    final File heapDumpFile = leakDirectoryProvider.newHeapDumpFile();
 
     if (heapDumpFile == RETRY_LATER) {
       return RETRY_LATER;
@@ -92,7 +96,11 @@ public final class AndroidHeapDumper implements HeapDumper {
 
     Toast toast = waitingForToast.get();
     try {
-      Debug.dumpHprofData(heapDumpFile.getAbsolutePath());
+      refWatcher.saveRetainedKeysWithHeapDump(new RefWatcher.HeapSaver() {
+        @Override public void saveHeap() throws IOException {
+          Debug.dumpHprofData(heapDumpFile.getAbsolutePath());
+        }
+      });
       cancelToast(toast);
       notificationManager.cancel(notificationId);
       return heapDumpFile;

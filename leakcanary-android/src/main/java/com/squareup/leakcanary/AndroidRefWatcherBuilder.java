@@ -111,7 +111,7 @@ public final class AndroidRefWatcherBuilder extends RefWatcherBuilder<AndroidRef
   @Override protected @NonNull HeapDumper defaultHeapDumper() {
     LeakDirectoryProvider leakDirectoryProvider =
         LeakCanaryInternals.getLeakDirectoryProvider(context);
-    return new AndroidHeapDumper(context, leakDirectoryProvider);
+    return new AndroidHeapDumper(context, leakDirectoryProvider, refWatcher);
   }
 
   @Override protected @NonNull DebuggerControl defaultDebuggerControl() {
